@@ -24,10 +24,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === 配置区域 ===
-# 修改为您的 Nature 数据集根目录
-MAT_ROOT_DIR = Path(r"D:\论文\data_nature") 
+MAT_ROOT_DIR = Path(r"/root/autodl-tmp/mmWave/data_nature") 
 OUT_DIR = Path("results/nature_dataset_120hz")
-INDEX_FILE = OUT_DIR / "nature_dataset_index.csv" # 结果索引文件
+INDEX_FILE = OUT_DIR / "nature_dataset_index.csv" 
 
 TARGET_FS = 120.0
 MAX_DIST_SAMPLES = 30
@@ -54,6 +53,46 @@ def process_cw_radar_phase(i_sig, q_sig):
     q_centered = q_sig - np.mean(q_sig)
     return np.unwrap(np.arctan2(q_centered, i_centered))
 
+# === 新增：Pan-Tompkins 风格的鲁棒 ECG 峰值检测 ===
+def robust_ecg_peak_detection(ecg_raw: np.ndarray, fs: float):
+    """
+    基于 Pan-Tompkins 思想的鲁棒 R 峰检测
+    """
+    # 1. 带通滤波 (5-15Hz): 集中 R 峰能量，去除基线和肌电
+    sos = signal.butter(4, [5, 15], btype='band', fs=fs, output='sos')
+    ecg_band = signal.sosfiltfilt(sos, ecg_raw)
+    
+    # 2. 微分 (Derivative)
+    ecg_diff = np.diff(ecg_band, prepend=ecg_band[0])
+    
+    # 3. 平方 (Squaring)
+    ecg_sq = ecg_diff ** 2
+    
+    # 4. 移动窗口积分 (Window ~150ms)
+    window_width = int(0.15 * fs)
+    kernel = np.ones(window_width) / window_width
+    ecg_integ = np.convolve(ecg_sq, kernel, mode='same')
+    
+    # 5. 自适应寻峰
+    # 积分后的波形非常平滑，抗噪性强
+    min_height = np.mean(ecg_integ) + 0.5 * np.std(ecg_integ)
+    distance = int(0.3 * fs) # 不应期 300ms
+    
+    peaks_idx, _ = signal.find_peaks(ecg_integ, height=min_height, distance=distance)
+    
+    # [精修] 回溯原始信号找精确最大值点
+    # 因为积分会引入相移，需要在积分峰值附近找原始 ecg_band 的最大值
+    refined_peaks = []
+    search_win = int(0.1 * fs)
+    for p in peaks_idx:
+        start = max(0, p - search_win)
+        end = min(len(ecg_band), p + search_win)
+        if end > start:
+            local_peak = start + np.argmax(ecg_band[start:end])
+            refined_peaks.append(local_peak)
+        
+    return np.array(refined_peaks)
+
 def process_mat_file(mat_path):
     try:
         mat = scipy.io.loadmat(mat_path)
@@ -75,25 +114,31 @@ def process_mat_file(mat_path):
         sos = signal.butter(4, [0.8, 3.0], btype='band', fs=fs_raw, output='sos')
         radar_heart_highres = signal.sosfiltfilt(sos, phase_raw)
 
-        # 2. ECG 处理 (计算真值)
-        sos_ecg = signal.butter(4, [10, 40], btype='band', fs=fs_raw, output='sos')
-        ecg_filtered = signal.sosfiltfilt(sos_ecg, raw_ecg)
-        
-        # 寻峰 (2000Hz 高精度)
-        peaks_idx, _ = signal.find_peaks(ecg_filtered, distance=int(0.3 * fs_raw), prominence=np.std(ecg_filtered)*2)
+        # 2. ECG 处理 (升级为 Robust Detection)
+        # 使用 Pan-Tompkins 算法提取峰值索引
+        peaks_idx = robust_ecg_peak_detection(raw_ecg, fs_raw)
         peaks_time = peaks_idx / fs_raw
         
-        # === 计算 HRV 真值 ===
+        # === 新增：SQI 质量过滤 ===
         rr_s = np.diff(peaks_time)
-        hrv_metrics = {}
-        if len(rr_s) > 1:
-            # 调用 core_hrv 计算
-            hrv_metrics = compute_hrv_metrics(rr_s)
+        if len(rr_s) < 2:
+            logger.warning(f"Skip {mat_path.name}: Too few peaks")
+            return None
+            
+        # 检查 RR 间隔稳定性
+        # 如果相邻 RR 变化超过 30%，说明 ECG 信号质量差或有严重心律失常
+        rr_diff_pct = np.abs(np.diff(rr_s)) / rr_s[:-1]
+        if np.any(rr_diff_pct > 0.3):
+            logger.warning(f"Skip {mat_path.name}: Unstable RR (SQI Fail)")
+            return None # 直接丢弃该文件，不让坏数据污染训练集
+
+        # === 计算 HRV 真值 ===
+        hrv_metrics = compute_hrv_metrics(rr_s)
         
         # 提取关键指标用于索引
         true_bpm = hrv_metrics.get('mean_hr_bpm', np.nan)
         true_rmssd = hrv_metrics.get('rmssd_ms', np.nan)
-        true_sdnn = hrv_metrics.get('sdnn_ms', np.nan) # core_hrv 可能返回 sdnn_ms 或 sdnn
+        true_sdnn = hrv_metrics.get('sdnn_ms', np.nan) 
         if np.isnan(true_sdnn): true_sdnn = hrv_metrics.get('sdnn', np.nan)
 
         # 3. 降采样到 120Hz
@@ -123,7 +168,6 @@ def process_mat_file(mat_path):
             fs=TARGET_FS
         )
         
-        # 返回样本元数据
         return {
             "session_id": session_id,
             "duration_s": duration,
@@ -159,7 +203,7 @@ def main():
         df = pd.DataFrame(records)
         df.to_csv(INDEX_FILE, index=False)
         print(f"\nSuccess! Index saved to {INDEX_FILE}")
-        print(f"Total processed: {count}")
+        print(f"Total processed: {count} / {len(mat_files)}")
         print(df[['session_id', 'true_bpm', 'true_rmssd']].head())
     else:
         print("No files processed.")

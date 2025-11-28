@@ -40,7 +40,7 @@ def find_peaks_from_distance_map(dist_map, threshold=0.3):
 def run_evaluation():
     # 1. 加载测试集 (最后 20 个 session)
     try:
-        test_set = RadarECGDataset(DATA_DIR, mode='test', test_size=20)
+        test_set = RadarECGDataset(DATA_DIR, mode='test', test_subjects=5)
     except ValueError as e:
         print(f"Dataset Error: {e}")
         return
