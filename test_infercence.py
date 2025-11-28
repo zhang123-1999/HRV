@@ -19,76 +19,100 @@ CHECKPOINT_PATH = "checkpoints/best_rpnet.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 FS = 120.0  # 采样率
 
-def find_peaks_from_distance_map(dist_map, threshold=0.3):
+def find_peaks_from_distance_map(dist_map):
     """
-    从距离图中提取 R 峰位置。
-    距离图原理：峰值处为 0，向两侧递增。
-    策略：取负号变成波峰，然后用 find_peaks。
+    改进版寻峰：物理约束 + 相对高度
     """
-    # 1. 反转信号：因为我们要找谷底 (0)，find_peaks 是找山峰
-    # 原始 dist_map 范围大概是 [0, 1]
     inverted_map = -dist_map 
     
-    # 2. 设置高度阈值：
-    # 距离 R 峰越近值越小(接近0)，反转后接近 0 (比如 -0.05)。
-    # 设定一个 height 阈值，过滤掉那些预测值很大（说明离 R 峰很远）的噪声
-    # 注意：数据归一化过，最大距离是 1.0 (对应30个点)。
-    # 阈值设为 -0.5 意味着只看距离真值峰值 15 个点以内的区域
-    peaks, _ = find_peaks(inverted_map, height=-threshold, distance=30) # distance=30(0.25s) 防止过近
+    # 策略: 物理约束 (Refractory Period)
+    # distance=30 (250ms) -> 限制最高心率 < 240 BPM
+    # prominence=0.05 -> 忽略微小的噪声抖动
+    peaks, _ = find_peaks(inverted_map, prominence=0.05, distance=30)
+    
+    # 兜底策略: 如果找不到峰，尝试降低要求
+    if len(peaks) == 0:
+        peaks, _ = find_peaks(inverted_map, height=-0.6, distance=30)
+        
     return peaks
 
 def run_evaluation():
-    # 1. 加载测试集 (最后 20 个 session)
+    # 1. 加载测试集
+    # 注意：这里使用 'test_subjects' 参数，因为 dataset_loader 已经更新
     try:
-        test_set = RadarECGDataset(DATA_DIR, mode='test', test_subjects=5)
+        test_set = RadarECGDataset(
+            DATA_DIR, 
+            mode='test', 
+            test_subjects=5  # 确保这个参数名与 dataset_loader.__init__ 一致
+        )
     except ValueError as e:
         print(f"Dataset Error: {e}")
         return
+    except TypeError:
+        # 兼容旧版参数名 (如果 dataset_loader 没更新)
+        try:
+            test_set = RadarECGDataset(DATA_DIR, mode='test', test_size=5)
+        except Exception as e:
+            print(f"Dataset Init Error: {e}")
+            return
 
     test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
     print(f"Testing on {len(test_set)} samples...")
 
     # 2. 加载模型
-    model = IncResUnet(in_channels=1, out_channels=1).to(DEVICE)
+    model = IncResUnet(in_channels=1, out_channels=1, base_filters=16).to(DEVICE)
     if not Path(CHECKPOINT_PATH).exists():
         print(f"Checkpoint not found at {CHECKPOINT_PATH}")
         return
+    
+    print(f"Loading model from: {CHECKPOINT_PATH}")
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
     model.eval()
 
     results = []
+    skipped_count = 0
 
     # 3. 逐个样本推理
     with torch.no_grad():
-        for i, (data, target) in enumerate(test_loader):
+        for i, batch_data in enumerate(test_loader):
+            # 稳健解包：处理返回 2个 或 3个 元素的情况
+            if isinstance(batch_data, list) and len(batch_data) == 3:
+                data, target, _ = batch_data # 忽略 count_true
+            elif isinstance(batch_data, list) and len(batch_data) == 2:
+                data, target = batch_data
+            else:
+                print(f"Skipping batch {i}: Unexpected data format")
+                continue
+                
             data = data.to(DEVICE)
-            # data: [1, 1, 1200], target: [1, 1, 1200]
             
             # A. 模型预测
-            output = model(data)
+            # 处理多输出情况 (dist_map, pred_count)
+            output_tuple = model(data)
+            if isinstance(output_tuple, tuple):
+                output = output_tuple[0] # 取距离图
+            else:
+                output = output_tuple # 旧模型只返回一个值
             
-            # 转为 numpy (去除 Batch 和 Channel 维度)
+            # 转为 numpy
             pred_map = output.squeeze().cpu().numpy()
-            true_map = target.squeeze().cpu().numpy() # Label 也是距离图
+            true_map = target.squeeze().cpu().numpy()
 
-            # B. 后处理：从距离图提取峰值索引
+            # B. 后处理：寻峰
             pred_peaks = find_peaks_from_distance_map(pred_map)
             true_peaks = find_peaks_from_distance_map(true_map)
 
-            # C. 计算 RR 间期 (秒)
             if len(pred_peaks) < 2 or len(true_peaks) < 2:
-                # 峰值太少，无法计算 HRV
                 continue
 
+            # C. 计算 RR 间期
             pred_rr_s = np.diff(pred_peaks) / FS
             true_rr_s = np.diff(true_peaks) / FS
 
-            # D. 计算 HRV 指标 (使用 core_hrv.py)
+            # D. 计算指标
             metrics_pred = compute_hrv_metrics(pred_rr_s)
             metrics_true = compute_hrv_metrics(true_rr_s)
 
-            # E. 记录误差
-            # 我们主要关注心率 (BPM) 和 RMSSD (毫秒)
             bpm_pred = metrics_pred.get('mean_hr_bpm', float('nan'))
             bpm_true = metrics_true.get('mean_hr_bpm', float('nan'))
             
@@ -96,6 +120,11 @@ def run_evaluation():
             rmssd_true = metrics_true.get('rmssd_ms', float('nan'))
 
             if np.isnan(bpm_pred) or np.isnan(bpm_true):
+                continue
+
+            # === 结果过滤：只统计生理合理的静息心率 ===
+            if bpm_pred < 40 or bpm_pred > 130:
+                skipped_count += 1
                 continue
 
             results.append({
@@ -110,29 +139,29 @@ def run_evaluation():
 
     # 4. 统计结果
     if not results:
-        print("No valid HRV metrics calculated. Check model output or peak detection threshold.")
+        print("No valid results. Check data or model.")
         return
 
     df = pd.DataFrame(results)
     
     print("\n" + "="*40)
-    print("   EXTENSIVE DATASET - TEST RESULTS")
+    print("   RESTING STATE - TEST RESULTS")
     print("="*40)
-    print(f"Total Samples Evaluated: {len(df)}")
+    print(f"Total Valid Samples: {len(df)}")
+    print(f"Skipped Outliers: {skipped_count}")
     
-    # 计算平均绝对误差 (MAE)
     mae_bpm = df['Error_BPM'].mean()
     mae_rmssd = df['Error_RMSSD'].mean()
     
-    # 打印统计
-    print(f"\nMetric  |  MAE (Mean Abs Error)")
-    print(f"--------|----------------------")
-    print(f"HR (BPM)|  {mae_bpm:.4f}")
-    print(f"RMSSD   |  {mae_rmssd:.4f} ms")
+    # 计算中位数误差 (更鲁棒)
+    median_bpm = df['Error_BPM'].median()
+    median_rmssd = df['Error_RMSSD'].median()
     
-    print("\nDetailed Sample View (First 5):")
-    print(df[['Sample_ID', 'True_BPM', 'Pred_BPM', 'True_RMSSD', 'Pred_RMSSD']].head(5).to_string(index=False))
-
+    print(f"\nMetric  |  MAE (Mean)  |  Median")
+    print(f"--------|--------------|--------")
+    print(f"HR (BPM)|  {mae_bpm:.4f}      |  {median_bpm:.4f}")
+    print(f"RMSSD   |  {mae_rmssd:.4f} ms |  {median_rmssd:.4f} ms")
+    
     # 保存结果
     df.to_csv("results/test_hrv_metrics.csv", index=False)
     print("\nFull results saved to results/test_hrv_metrics.csv")

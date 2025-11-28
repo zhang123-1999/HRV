@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === 配置区域 ===
-MAT_ROOT_DIR = Path(r"/root/autodl-tmp/mmWave/data_nature") 
+MAT_ROOT_DIR = Path(r"/root/autodl-tmp/data_nature") 
 OUT_DIR = Path("results/nature_dataset_120hz")
 INDEX_FILE = OUT_DIR / "nature_dataset_index.csv" 
 
@@ -53,12 +53,12 @@ def process_cw_radar_phase(i_sig, q_sig):
     q_centered = q_sig - np.mean(q_sig)
     return np.unwrap(np.arctan2(q_centered, i_centered))
 
-# === 新增：Pan-Tompkins 风格的鲁棒 ECG 峰值检测 ===
+# === Pan-Tompkins 风格的鲁棒 ECG 峰值检测 ===
 def robust_ecg_peak_detection(ecg_raw: np.ndarray, fs: float):
     """
     基于 Pan-Tompkins 思想的鲁棒 R 峰检测
     """
-    # 1. 带通滤波 (5-15Hz): 集中 R 峰能量，去除基线和肌电
+    # 1. 带通滤波 (5-15Hz)
     sos = signal.butter(4, [5, 15], btype='band', fs=fs, output='sos')
     ecg_band = signal.sosfiltfilt(sos, ecg_raw)
     
@@ -74,14 +74,14 @@ def robust_ecg_peak_detection(ecg_raw: np.ndarray, fs: float):
     ecg_integ = np.convolve(ecg_sq, kernel, mode='same')
     
     # 5. 自适应寻峰
-    # 积分后的波形非常平滑，抗噪性强
-    min_height = np.mean(ecg_integ) + 0.5 * np.std(ecg_integ)
-    distance = int(0.3 * fs) # 不应期 300ms
+    # 修改点：降低阈值系数 0.5 -> 0.3，更容易找到小峰
+    min_height = np.mean(ecg_integ) + 0.3 * np.std(ecg_integ) 
+    # 修改点：缩短最小间距 300ms -> 250ms，适应高心率
+    distance = int(0.25 * fs) 
     
     peaks_idx, _ = signal.find_peaks(ecg_integ, height=min_height, distance=distance)
     
     # [精修] 回溯原始信号找精确最大值点
-    # 因为积分会引入相移，需要在积分峰值附近找原始 ecg_band 的最大值
     refined_peaks = []
     search_win = int(0.1 * fs)
     for p in peaks_idx:
@@ -97,7 +97,6 @@ def process_mat_file(mat_path):
     try:
         mat = scipy.io.loadmat(mat_path)
         
-        # 检查 Key
         if 'radar_i' not in mat or 'tfm_ecg1' not in mat:
             return None
 
@@ -114,28 +113,31 @@ def process_mat_file(mat_path):
         sos = signal.butter(4, [0.8, 3.0], btype='band', fs=fs_raw, output='sos')
         radar_heart_highres = signal.sosfiltfilt(sos, phase_raw)
 
-        # 2. ECG 处理 (升级为 Robust Detection)
-        # 使用 Pan-Tompkins 算法提取峰值索引
+        # 2. ECG 处理
         peaks_idx = robust_ecg_peak_detection(raw_ecg, fs_raw)
         peaks_time = peaks_idx / fs_raw
         
-        # === 新增：SQI 质量过滤 ===
+        # === 修改后的 SQI 质量过滤 ===
         rr_s = np.diff(peaks_time)
-        if len(rr_s) < 2:
-            logger.warning(f"Skip {mat_path.name}: Too few peaks")
+        if len(rr_s) < 10: # 至少要有10个间隔才算有效
+            logger.warning(f"Skip {mat_path.name}: Too few peaks ({len(rr_s)})")
             return None
             
-        # 检查 RR 间隔稳定性
-        # 如果相邻 RR 变化超过 30%，说明 ECG 信号质量差或有严重心律失常
+        # 1. 生理极限检查 (Physiological Limits)
+        # RR 间隔应大于 0.3s (心率 < 200 bpm) 且小于 2.0s (心率 > 30 bpm)
+        if np.any(rr_s < 0.3) or np.any(rr_s > 2.0):
+            logger.warning(f"Skip {mat_path.name}: RR interval out of physiological limits (<0.3s or >2.0s)")
+            return None
+
+        # 2. 稳定性检查 (Stability Check)
+        # 相邻 RR 间隔变化率应小于 20% (0.2)
         rr_diff_pct = np.abs(np.diff(rr_s)) / rr_s[:-1]
-        if np.any(rr_diff_pct > 0.3):
-            logger.warning(f"Skip {mat_path.name}: Unstable RR (SQI Fail)")
-            return None # 直接丢弃该文件，不让坏数据污染训练集
+        if np.any(rr_diff_pct > 0.2):
+            logger.warning(f"Skip {mat_path.name}: Unstable RR (Change > 20%)")
+            return None 
 
         # === 计算 HRV 真值 ===
         hrv_metrics = compute_hrv_metrics(rr_s)
-        
-        # 提取关键指标用于索引
         true_bpm = hrv_metrics.get('mean_hr_bpm', np.nan)
         true_rmssd = hrv_metrics.get('rmssd_ms', np.nan)
         true_sdnn = hrv_metrics.get('sdnn_ms', np.nan) 

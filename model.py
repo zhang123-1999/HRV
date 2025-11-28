@@ -152,76 +152,67 @@ class DecoderBlock(nn.Module):
         return x
 
 class IncResUnet(nn.Module):
-    """
-    Full RPnet Architecture adapted for 120Hz/1200 length inputs.
-    Now with CBAM Attention Mechanism!
-    """
     def __init__(self, in_channels=1, out_channels=1, base_filters=16):
         super().__init__()
         
-        # Encoder Path
-        # Use kernel_size=3, padding=1 to maintain 1200 length (avoid 1201 issue)
+        # ... (Encoder 和 CBAM 定义保持不变) ...
         self.enc1 = nn.Sequential(
             nn.Conv1d(in_channels, base_filters, kernel_size=3, padding=1),
             nn.BatchNorm1d(base_filters),
             nn.LeakyReLU(0.2, inplace=True),
             ResInceptionBlock(base_filters, base_filters)
         )
-        # 注意力层 0 (可选，这里不加，保持浅层特征原始性)
-        
-        self.pool1 = EncoderBlock(base_filters, base_filters * 2)      # 1200 -> 600
-        self.cbam1 = CBAM(base_filters * 2)                            # Attention 1
-        
-        self.pool2 = EncoderBlock(base_filters * 2, base_filters * 4)  # 600 -> 300
-        self.cbam2 = CBAM(base_filters * 4)                            # Attention 2
-        
-        self.pool3 = EncoderBlock(base_filters * 4, base_filters * 8)  # 300 -> 150
-        self.cbam3 = CBAM(base_filters * 8)                            # Attention 3
-        
-        self.pool4 = EncoderBlock(base_filters * 8, base_filters * 16) # 150 -> 75
-        self.cbam4 = CBAM(base_filters * 16)                           # Attention 4
+        self.pool1 = EncoderBlock(base_filters, base_filters * 2)
+        self.cbam1 = CBAM(base_filters * 2)
+        self.pool2 = EncoderBlock(base_filters * 2, base_filters * 4)
+        self.cbam2 = CBAM(base_filters * 4)
+        self.pool3 = EncoderBlock(base_filters * 4, base_filters * 8)
+        self.cbam3 = CBAM(base_filters * 8)
+        self.pool4 = EncoderBlock(base_filters * 8, base_filters * 16)
+        self.cbam4 = CBAM(base_filters * 16)
 
-        # Dropout for regularization
         self.dropout = nn.Dropout(p=0.5)
-
-        # Bottleneck
         self.bottleneck = ResInceptionBlock(base_filters * 16, base_filters * 16)
 
-        # Decoder Path
-        self.up4 = DecoderBlock(base_filters * 16, base_filters * 8, base_filters * 8) # 75 -> 150
-        self.up3 = DecoderBlock(base_filters * 8, base_filters * 4, base_filters * 4)  # 150 -> 300
-        self.up2 = DecoderBlock(base_filters * 4, base_filters * 2, base_filters * 2)  # 300 -> 600
-        self.up1 = DecoderBlock(base_filters * 2, base_filters, base_filters)          # 600 -> 1200
-
-        # Final Classifier
+        # ... (Decoder 定义保持不变) ...
+        self.up4 = DecoderBlock(base_filters * 16, base_filters * 8, base_filters * 8)
+        self.up3 = DecoderBlock(base_filters * 8, base_filters * 4, base_filters * 4)
+        self.up2 = DecoderBlock(base_filters * 4, base_filters * 2, base_filters * 2)
+        self.up1 = DecoderBlock(base_filters * 2, base_filters, base_filters)
         self.final_conv = nn.Conv1d(base_filters, out_channels, kernel_size=1)
 
+        # === 新增：计数回归头 (Count Head) ===
+        # 输入是瓶颈层特征 [B, 256, 75] -> 全局平均池化 -> [B, 256] -> FC -> [B, 1]
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.count_head = nn.Sequential(
+            nn.Linear(base_filters * 16, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(64, 1) # 输出标量：R峰数量
+        )
+
     def forward(self, x):
-        # Encoder
+        # Encoder Path
         e1 = self.enc1(x)
-        
-        e2 = self.pool1(e1)
-        e2 = self.cbam1(e2) # Apply Attention
-        
-        e3 = self.pool2(e2)
-        e3 = self.cbam2(e3) # Apply Attention
-        
-        e4 = self.pool3(e3)
-        e4 = self.cbam3(e4) # Apply Attention
-        
-        e5 = self.pool4(e4)
-        e5 = self.cbam4(e5) # Apply Attention
+        e2 = self.cbam1(self.pool1(e1))
+        e3 = self.cbam2(self.pool2(e2))
+        e4 = self.cbam3(self.pool3(e3))
+        e5 = self.cbam4(self.pool4(e4))
 
-        # Bottleneck with Dropout
-        e5_drop = self.dropout(e5)
-        b = self.bottleneck(e5_drop)
+        # Bottleneck
+        b = self.bottleneck(self.dropout(e5))
 
-        # Decoder with Skip Connections
-        # 注意：这里我们传入的是经过 Attention 加权后的 e4, e3 等
-        # 这样 Skip Connection 带过去的是“提纯”后的特征
+        # === 分支 1: 计数头 ===
+        # 使用 bottleneck 的特征来预测数量
+        b_pooled = self.global_pool(b).flatten(1) # [B, 256, 1] -> [B, 256]
+        pred_count = self.count_head(b_pooled)
+
+        # === 分支 2: 解码器 (生成距离图) ===
         d4 = self.up4(b, e4)
         d3 = self.up3(d4, e3)
         d2 = self.up2(d3, e2)
         d1 = self.up1(d2, e1)
+        dist_map = self.final_conv(d1)
 
-        return self.final_conv(d1)
+        # 返回两个输出
+        return dist_map, pred_count

@@ -20,87 +20,85 @@ SAVE_DIR = "checkpoints"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ... (Imports) ...
+  
 def train():
     Path(SAVE_DIR).mkdir(exist_ok=True)
 
-    # 1. 加载数据集
-    logger.info("Loading datasets...")
-    
-    # === 修正点：参数名改为 test_subjects ===
-    # 训练集：加载除了最后 5 个受试者之外的所有数据 (Resting + Tilt + ...)
-    train_set = RadarECGDataset(
-        DATA_DIR, 
-        mode='train', 
-        split_ratio=0.8, 
-        test_subjects=5 
-    )
-    
-    # 验证集：同上，从训练受试者中分出 20%
-    val_set = RadarECGDataset(
-        DATA_DIR, 
-        mode='val', 
-        split_ratio=0.8, 
-        test_subjects=5
-    )
+    # 1. Dataset (Loader 现在返回 3 个值)
+    train_set = RadarECGDataset(DATA_DIR, mode='train', split_ratio=0.8, test_subjects=5)
+    val_set = RadarECGDataset(DATA_DIR, mode='val', split_ratio=0.8, test_subjects=5)
 
-    # DataLoader
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    logger.info(f"Train samples: {len(train_set)}, Val samples: {len(val_set)}")
-
-    # 2. 模型、损失、优化器
-    # 使用包含 Attention 的 IncResUnet (确保 model.py 也是最新的)
+    # 2. Model
     model = IncResUnet(in_channels=1, out_channels=1, base_filters=16).to(DEVICE)
     
-    criterion = nn.SmoothL1Loss()
-    # 加入 L2 正则化 (weight_decay) 防止过拟合
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    # 3. 损失函数
+    criterion_dist = nn.SmoothL1Loss() # 距离图损失
+    criterion_count = nn.SmoothL1Loss() # 计数损失
     
-    # 可选：学习率调度器 (如果 Loss 不降，自动减小 LR)
+    # 权重系数：距离图Loss一般在0.01级别，计数Loss可能在1.0级别(差1个峰)
+    # 我们希望两者梯度贡献均衡，给计数Loss乘一个小系数
+    LAMBDA_COUNT = 0.05 
+
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     best_val_loss = float('inf')
 
-    # 3. 训练循环
     for epoch in range(EPOCHS):
         model.train()
-        train_loss = 0.0
+        total_loss_train = 0.0
         
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(DEVICE), target.to(DEVICE)
+        # 注意：这里解包出 3 个变量
+        for batch_idx, (data, target_dist, target_count) in enumerate(train_loader):
+            data = data.to(DEVICE)
+            target_dist = target_dist.to(DEVICE)
+            target_count = target_count.to(DEVICE) # [B, 1]
 
             optimizer.zero_grad()
-            output = model(data)
             
-            loss = criterion(output, target)
+            # Forward 返回两个结果
+            pred_dist, pred_count = model(data)
+            
+            # 计算两个 Loss
+            loss_d = criterion_dist(pred_dist, target_dist)
+            loss_c = criterion_count(pred_count, target_count)
+            
+            # 组合 Loss
+            loss = loss_d + LAMBDA_COUNT * loss_c
             
             loss.backward()
             optimizer.step()
             
-            train_loss += loss.item()
+            total_loss_train += loss.item()
         
-        avg_train_loss = train_loss / len(train_loader)
+        avg_train_loss = total_loss_train / len(train_loader)
 
-        # 4. 验证循环
+        # Validation
         model.eval()
-        val_loss = 0.0
+        total_loss_val = 0.0
         with torch.no_grad():
-            for data, target in val_loader:
-                data, target = data.to(DEVICE), target.to(DEVICE)
-                output = model(data)
-                loss = criterion(output, target)
-                val_loss += loss.item()
+            for data, target_dist, target_count in val_loader:
+                data = data.to(DEVICE)
+                target_dist = target_dist.to(DEVICE)
+                target_count = target_count.to(DEVICE)
+                
+                pred_dist, pred_count = model(data)
+                
+                loss_d = criterion_dist(pred_dist, target_dist)
+                loss_c = criterion_count(pred_count, target_count)
+                loss = loss_d + LAMBDA_COUNT * loss_c
+                
+                total_loss_val += loss.item()
         
-        avg_val_loss = val_loss / len(val_loader)
-        
-        # 更新学习率
+        avg_val_loss = total_loss_val / len(val_loader)
         scheduler.step(avg_val_loss)
 
-        current_lr = optimizer.param_groups[0]['lr']
-        logger.info(f"Epoch [{epoch+1}/{EPOCHS}] Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | LR: {current_lr:.6e}")
+        logger.info(f"Epoch [{epoch+1}/{EPOCHS}] Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
 
-        # 保存最佳模型
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), f"{SAVE_DIR}/best_rpnet.pth")
