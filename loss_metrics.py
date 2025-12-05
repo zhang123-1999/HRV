@@ -14,19 +14,27 @@ class PhysioLoss(nn.Module):
         # 1 - Pearson Correlation
         x_mean = x - x.mean(dim=1, keepdim=True)
         y_mean = y - y.mean(dim=1, keepdim=True)
+        
         cov = (x_mean * y_mean).sum(dim=1)
-        x_var = torch.sqrt((x_mean ** 2).sum(dim=1) + 1e-8)
-        y_var = torch.sqrt((y_mean ** 2).sum(dim=1) + 1e-8)
-        corr = cov / (x_var * y_var)
+        
+        # === 修改：增加 epsilon 到 1e-6，防止除零 ===
+        eps = 1e-6
+        x_var = torch.sqrt((x_mean ** 2).sum(dim=1) + eps)
+        y_var = torch.sqrt((y_mean ** 2).sum(dim=1) + eps)
+        
+        corr = cov / (x_var * y_var + eps) # 分母再加一次安全锁
         return 1 - corr.mean()
 
     def freq_loss(self, pred, target):
         # FFT 幅度差异
         pred_fft = torch.fft.rfft(pred, dim=1).abs()
         target_fft = torch.fft.rfft(target, dim=1).abs()
-        # 归一化后比较，关注能量分布形状
-        pred_fft = pred_fft / (pred_fft.sum(dim=1, keepdim=True) + 1e-8)
-        target_fft = target_fft / (target_fft.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # === 修改：增加 epsilon ===
+        eps = 1e-6
+        pred_fft = pred_fft / (pred_fft.sum(dim=1, keepdim=True) + eps)
+        target_fft = target_fft / (target_fft.sum(dim=1, keepdim=True) + eps)
+        
         return self.l1(pred_fft, target_fft)
 
     def forward(self, pred, target):

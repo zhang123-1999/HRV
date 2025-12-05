@@ -12,7 +12,7 @@ from model_transformer import SpectroTransNet
 from loss_metrics import PhysioLoss # 确保 loss_metrics.py 文件在目录下
 
 # Config
-DATA_DIR = "results/nature_dataset_120hz"
+DATA_DIR = "results/nature_dataset_cleaned"
 BATCH_SIZE = 64
 EPOCHS = 100
 LR = 1e-4
@@ -26,8 +26,8 @@ def train():
     torch.backends.cudnn.benchmark = True
     
     # Dataset & Loader
-    train_set = RadarSpectrogramDataset(DATA_DIR, mode='train', test_subjects=5)
-    val_set = RadarSpectrogramDataset(DATA_DIR, mode='val', test_subjects=5)
+    train_set = RadarSpectrogramDataset(DATA_DIR, mode='train')
+    val_set = RadarSpectrogramDataset(DATA_DIR, mode='val')
     
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
@@ -43,7 +43,9 @@ def train():
     criterion = PhysioLoss(alpha=1.0, beta=1.0, gamma=0.1).to(DEVICE)
     
     scaler = GradScaler()
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=len(train_loader), epochs=EPOCHS)
+    # === 建议修改 1: 降低一点学习率 ===
+    # Transformer 对 LR 很敏感，1e-3 有点激进，改成 5e-4 或 1e-4 更稳
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=5e-4, steps_per_epoch=len(train_loader), epochs=EPOCHS)
 
     best_mae = float('inf')
 
@@ -51,20 +53,39 @@ def train():
         model.train()
         train_loss_acc = 0
         
-        for x, y in train_loader:
-            x, y = x.to(DEVICE), y.to(DEVICE) # y 现在是 [B, 1200] 的 BPM 曲线
+        for batch_idx, (x, y) in enumerate(train_loader):
+            x, y = x.to(DEVICE), y.to(DEVICE)
             
             optimizer.zero_grad()
             
+            # 1. Forward
             with autocast():
                 pred = model(x)
-                # PhysioLoss 返回总 loss 和 各个分项
                 loss, _ = criterion(pred, y)
             
+            # 2. Backward
             scaler.scale(loss).backward()
+            
+            # === 关键修改：梯度裁剪 (Gradient Clipping) ===
+            # 先将梯度从缩放状态还原 (Unscale)
+            scaler.unscale_(optimizer)
+            
+            # 对梯度进行裁剪，最大范数设为 1.0 (常用值)
+            # 这能有效防止梯度爆炸导致的 NaN
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # 3. Step
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            
+            # === 调试：检测是否出现 NaN ===
+            if torch.isnan(loss):
+                logger.error(f"Loss is NaN at batch {batch_idx}!")
+                logger.error(f"Pred range: {pred.min().item()} - {pred.max().item()}")
+                logger.error(f"Target range: {y.min().item()} - {y.max().item()}")
+                # 遇到 NaN 跳过这一步，不要让模型权重被污染 (可选 break)
+                # break 
             
             train_loss_acc += loss.item()
             
