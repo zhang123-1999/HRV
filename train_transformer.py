@@ -40,7 +40,16 @@ def train():
     
     # === 关键修改：使用 PhysioLoss ===
     # alpha=MAE, beta=Pearson, gamma=Freq
-    criterion = PhysioLoss(alpha=1.0, beta=1.0, gamma=0.1).to(DEVICE)
+   # 刚开始主要看 MAE，Delta Loss 权重给小一点
+    # lambda_diff=20.0: 给差分损失极高的权重，强迫模型关注微小的跳变
+    # delta_weight=1.0: 恢复上一版的动态加权，狠抓高变异性样本
+    criterion = PhysioLoss(
+        alpha=1.0, 
+        beta=0.5, 
+        gamma=0.1, 
+        lambda_diff=10.0, 
+        delta_weight=2.0
+    ).to(DEVICE)
     
     scaler = GradScaler()
     # === 建议修改 1: 降低一点学习率 ===
@@ -55,6 +64,11 @@ def train():
         
         for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(DEVICE), y.to(DEVICE)
+            
+            # === Debug: Check for NaNs in data ===
+            if torch.isnan(x).any() or torch.isnan(y).any():
+                logger.warning(f"Found NaN in input data at batch {batch_idx}. Skipping...")
+                continue
             
             optimizer.zero_grad()
             

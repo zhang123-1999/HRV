@@ -10,26 +10,42 @@ DATA_DIR = "results/nature_dataset_cleaned"
 CHECKPOINT = "checkpoints_trans/best_model.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def calculate_rmssd(bpm_curve, fs=120.0):
+def calculate_rmssd_from_curve(bpm_curve, fs=120.0):
     """
-    从 BPM 曲线计算 RMSSD (单位: ms)
+    修正版: 通过积分法 (IPFM) 从连续 BPM 曲线还原离散 R 峰，
+    从而计算出物理意义正确的 RMSSD。
     """
-    # 1. 降采样: 120Hz 对 HRV 计算来说太密了，且插值曲线相邻点差异极小。
-    #    降采样到 4Hz (每秒4个点) 比较接近真实的 Tachogram 采样密度。
-    target_fs = 4.0
-    step = int(fs / target_fs)
-    if step < 1: step = 1
+    # 1. 将 BPM 转换为 瞬时频率 (Hz = beats / sec)
+    #    bpm_curve shape: [1200]
+    freq_curve = bpm_curve / 60.0
     
-    bpm_down = bpm_curve[::step]
+    # 2. 积分 (Cumulative Sum) 计算累积相位 (单位: cycles/beats)
+    #    除以 fs 是因为 dt = 1/fs
+    #    phase[t] 表示从 0时刻到 t时刻 总共跳了多少下
+    phase = np.cumsum(freq_curve) / fs
     
-    # 2. 转换为 RR 间期 (ms)
-    #    RR = 60000 / BPM
-    #    加一个极小值防止除零，虽然 BPM 通常 > 30
-    rr_ms = 60000.0 / (bpm_down + 1e-6)
+    # 3. 找峰 (Find Peaks)
+    #    每当 phase 跨越一个整数 (1.0, 2.0, 3.0...)，说明发生了一次心跳
+    #    我们可以检测 floor(phase) 的变化
+    beats_idx = np.where(np.diff(np.floor(phase)))[0]
     
-    # 3. 计算逐差平方均值根 (RMSSD)
-    #    diff = RR_{i+1} - RR_{i}
-    diffs = np.diff(rr_ms)
+    # 4. 如果还原出的心跳太少，无法计算 RMSSD
+    if len(beats_idx) < 2:
+        return np.nan
+        
+    # 5. 计算 离散 RR 间隔 (单位: ms)
+    #    beats_idx 是索引，除以 fs 得到秒
+    peak_times_s = beats_idx / fs
+    rr_intervals_ms = np.diff(peak_times_s) * 1000.0
+    
+    # 6. 计算标准 RMSSD
+    #    过滤掉非生理性的 RR (比如 < 300ms 或 > 1500ms) 防止噪声干扰
+    valid_rr = rr_intervals_ms[(rr_intervals_ms > 300) & (rr_intervals_ms < 1500)]
+    
+    if len(valid_rr) < 2:
+        return np.nan
+        
+    diffs = np.diff(valid_rr)
     rmssd = np.sqrt(np.mean(diffs**2))
     
     return rmssd
@@ -73,8 +89,8 @@ def evaluate():
             sdnn_true = np.std(y_curve)
             
             # 3. RMSSD (高频变异性 - ms单位) <--- 新增
-            rmssd_pred = calculate_rmssd(pred_curve, fs=120.0)
-            rmssd_true = calculate_rmssd(y_curve, fs=120.0)
+            rmssd_pred = calculate_rmssd_from_curve(pred_curve, fs=120.0)
+            rmssd_true = calculate_rmssd_from_curve(y_curve, fs=120.0)
             
             # === 异常值过滤 ===
             if bpm_pred < 30 or bpm_pred > 200 or np.isnan(bpm_pred):
