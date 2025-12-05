@@ -1,17 +1,6 @@
-# 忽略 Python 緩存
 __pycache__/
-*.py[cod]
-
-# 忽略數據集文件夾 (假設你的數據放在 data 文件夾下)
-data_ExtensivemmWave/
+旧代码/
+checkpoints/
 data_nature/
 tips/
-results/
-
-# 忽略大型模型權重文件
-*.pth
-*.ckpt
-*.h5
-
-# 忽略 Mac 系統產生的垃圾文件
-.DS_Store
+tip.md

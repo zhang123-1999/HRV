@@ -190,24 +190,39 @@ def compute_vital_signs_basic(
     fs: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    arctan + unwrap + 高通 + 位移转换。
-    返回 (vital_signs, locked_phase, unwrapped_phase)。
+    使用 DACM (Differentiate-and-Cross-Multiply) 计算相位微分，
+    避免 unwrap 在低信噪比下产生的跳变。返回 (displacement, raw_phase, restored_phase)。
     """
     locked_complex = range_fft[:, :, x_position]
-    locked_phase = np.angle(locked_complex)
-    unwrapped_phase = np.unwrap(np.unwrap(locked_phase, axis=1), axis=0)
+    # 将 chirp 维合并，得到随时间变化的一维复信号
+    if locked_complex.ndim > 1:
+        complex_sig = np.mean(locked_complex, axis=1)
+    else:
+        complex_sig = locked_complex
+
+    complex_sig = np.asarray(complex_sig, dtype=np.complex128)
+    raw_phase = np.angle(complex_sig)
+
+    # === DACM: d(phi)/dt = (I * dQ - Q * dI) / (I^2 + Q^2) ===
+    I = np.real(complex_sig)
+    Q = np.imag(complex_sig)
+    dI = np.gradient(I)
+    dQ = np.gradient(Q)
+    denominator = I**2 + Q**2 + 1e-9  # 防止除零
+    phase_diff = (I * dQ - Q * dI) / denominator
+
+    # 积分回相位轨迹，避免 unwrap 突变
+    restored_phase = np.cumsum(phase_diff)
 
     nyq = 0.5 * fs
     cutoff = float(config.get("highpass_cutoff", 0.07))
     cutoff = min(max(cutoff, 0.05), nyq * 0.99)
     b_high, a_high = signal.butter(4, cutoff / nyq, btype="high")
-    flattened = unwrapped_phase.reshape(-1)
-    detrended = signal.filtfilt(b_high, a_high, flattened)
-    detrended_phase = detrended.reshape(unwrapped_phase.shape)
+    detrended_phase = signal.filtfilt(b_high, a_high, restored_phase)
 
     displacement = (config["WAVELENGTH_M"] / (4 * np.pi)) * detrended_phase
-    vital_signs = np.mean(displacement, axis=1)
-    return vital_signs, locked_phase, unwrapped_phase
+    vital_signs = displacement
+    return vital_signs, raw_phase, restored_phase
 
 
 def _design_bandpass(low: float, high: float, nyq: float) -> tuple[np.ndarray, np.ndarray]:
